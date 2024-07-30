@@ -1,0 +1,537 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+River stations
+```{r}
+riverThames <- c("7027", "7034", "7035", "7036", "7037", "7038", "7046", "7048", "7049", "7055", "7056", "7057", "7072", "7405", "7073", "7083", "7085", "7086")
+riverOck <- c("7402", "7078", "7077")
+riverCherwell <- c("7059", "1414", "7063", "7064", "7066", "7071")
+streamsBrooks <- c("7039", "7001", "7075", "7074", "7076", "7003")
+riverStations <- c(riverThames, riverOck, riverCherwell, streamsBrooks)
+n <- length(riverStations)
+```
+
+fundamental adjacency matrix (0-1)
+```{r}
+river_list <- list(
+  Thames = riverThames,
+  Ock = riverOck,
+  Cherwell = riverCherwell
+)
+
+adjacencyMatrixGenerator <- function(river_list, n) {
+  adjacencyMatrix <- matrix(0, nrow = n, ncol = n, dimnames = list(riverStations, riverStations))
+  
+  for (river in river_list) {
+    for (i in 1:(length(river) - 1)) {
+      upstream <- river[i]
+      downstream <- river[i + 1]
+      adjacencyMatrix[upstream, downstream] <- 1
+    }
+  }
+
+  return(adjacencyMatrix)
+}
+
+adjMatrix1 <- adjacencyMatrixGenerator(river_list, n)
+```
+
+
+advanced adjacency matrix(considering station distances)
+```{r}
+library(geosphere)
+library(readxl)
+```
+
+```{r}
+file_path <- "station positions/station positions.xlsx"
+positionData <- read_excel(file_path)
+positionData <- as.data.frame(positionData)[,2:4] 
+print(positionData)
+```
+```{r}
+stationDistance <- function(df,station1, station2) {
+  station1Data <- df %>% filter(ID == as.character(station1))
+  station2Data <- df %>% filter(ID == as.character(station2))
+  
+  lat1 <- as.numeric(station1Data[2])
+  long1 <- as.numeric(station1Data[3])
+  lat2 <- as.numeric(station2Data[2])
+  long2 <- as.numeric(station2Data[3])
+  
+  return(distHaversine(c(lat1, long1), c(lat2, long2)))
+}
+
+distanceAdjMatrix <- function(df, river_list, n) {
+  adjacency_matrix <- matrix(0, nrow = n, ncol = n, dimnames = list(riverStations, riverStations))
+  
+  for (river in river_list) {
+    for (i in 1:(length(river) - 1)) {
+      upstream <- river[i]
+      downstream <- river[i + 1]
+      adjacency_matrix[upstream, downstream] <- stationDistance(df, upstream, downstream)
+    }
+  }
+
+  return(adjacency_matrix)
+}
+
+adjMatrix2 <- distanceAdjMatrix(positionData, river_list, n)
+```
+
+standardization
+```{r}
+nonZeroIndices <- which(adjMatrix2 != 0, arr.ind = TRUE)
+elements <- adjMatrix2[nonZeroIndices]
+adjMatrix2[adjMatrix2 != 0] <- (adjMatrix2[adjMatrix2 != 0])/ mean(elements)
+```
+
+retrieve df_all_stations
+```{r}
+df_15min <- tar_read(combined_15min_data) %>% select(date, height, station_id)
+df_hourly <- tar_read(combined_hourly_data)
+df_daily <- tar_read(combined_daily_data)
+df_weekly <- tar_read(combined_weekly_data)
+```
+
+
+
+Model fitting
+Only riverheight, no rainfall/riverflow
+getting training df(for certain tau)
+```{r}
+retrieveTrainingDf <- function(id, Fulldf, tau) {
+  upstreamPosition <- NA
+  stationPosition <- which(riverStations == as.character(id))
+  
+  if (stationPosition == 1) {
+    df <- Fulldf %>% filter(station_id == id) %>%
+                   mutate(heightU = 0) %>% 
+                   select(date, heightU, height, station_id)
+  } else if (adjMatrix1[stationPosition-1, stationPosition] == 1) {
+    upstreamPosition <- stationPosition - 1
+    dfUpstream <- Fulldf %>% filter(station_id == riverStations[upstreamPosition])
+    df <- Fulldf %>% filter(station_id == id) %>%
+                     mutate(heightU = dfUpstream$height) %>% 
+                     select(date, heightU, height, station_id)
+  } else {
+    df <- Fulldf %>% filter(station_id == id) %>%
+                   mutate(heightU = 0) %>% 
+                   select(date, heightU, height, station_id)
+  }
+  
+  if (tau < nrow(df)) {
+    df <- df %>% mutate(heightU = c(rep(NA, tau), heightU[1:(nrow(df) - tau)]))
+    df <- df %>% filter(!is.na(heightU))
+  } else {
+    warning("tau too large!!")
+  }
+  return(df)
+}
+```
+
+```{r}
+linearModelTraining1 <- function(id, df, tauVec) {
+  infoList <- list(taus = tauVec,models = list(), AIC = numeric(), Rsquare = numeric())
+  
+  for (i in seq_along(tauVec)) {
+    trainingDf <- retrieveTrainingDf(id, df, tauVec[i])
+    model <- lm(height ~ 1 + heightU, data = trainingDf)
+    infoList$models[[i]] <- model
+    infoList$AIC[i] <- AIC(model)
+    infoList$Rsquare[i] <- summary(model)$adj.r.squared
+  }
+  
+  return(infoList)
+}
+```
+
+test
+```{r}
+taus2 <- seq(1,20)
+testList <- linearModelTraining1(7072, df_15min, taus2)
+testList[c(1,3,4)]
+```
+Plots
+1. plots across different taus
+```{r}
+plotFunctionAcrossTaus <- function(tausVec, infoList) {
+  plotData <- data.frame(tausVec, infoList$AIC, infoList$Rsquare)
+  
+  pic1 <- ggplot(plotData, aes(x = tausVec, y = infoList$AIC)) +
+            geom_line() +
+            geom_point() +
+            labs(title = "AIC vs. tau", x = "tau", y = "AIC") +
+            theme_minimal()
+
+  pic2 <- ggplot(plotData, aes(x = tausVec, y = infoList$Rsquare)) +
+            geom_line() +
+            geom_point() +
+            labs(title = "(adjusted)Rsquare vs. tau", x = "tau", y = "Rsquare") +
+            theme_minimal()
+  
+  print(pic1)
+  print(pic2)
+}
+```
+
+2.plot across difference timeScale data
+```{r}
+plotFunctionAcrossTime <- function(infoList1, infoList2, infoList3, infoList4) {df <- data.frame(timeScale = c("15min", "hourly", "daily", "weekly"), 
+                              optTau = NA, Rsquare = NA)
+
+df$optTau[1] <- infoList1$taus[which.max(infoList1$Rsquare)]
+df$optTau[2] <- infoList2$taus[which.max(infoList2$Rsquare)]
+df$optTau[3] <- infoList3$taus[which.max(infoList3$Rsquare)]
+df$optTau[4] <- infoList4$taus[which.max(infoList4$Rsquare)]
+df$Rsquare[1] <- infoList1$Rsquare[which.max(infoList1$Rsquare)]
+df$Rsquare[2] <- infoList2$Rsquare[which.max(infoList2$Rsquare)]
+df$Rsquare[3] <- infoList3$Rsquare[which.max(infoList3$Rsquare)]
+df$Rsquare[4] <- infoList4$Rsquare[which.max(infoList4$Rsquare)]
+
+pic <- ggplot(df, aes(x = timeScale, y = Rsquare)) +
+         geom_bar(stat = "identity") +
+         labs(title = "Rsquare by Time Scale", x = "Time Scale", y = "Rsquare") +
+         theme_minimal()
+print(pic)
+}
+```
+
+test(7072)
+```{r}
+taus1 <- seq(1,20)
+testList1 <- linearModelTraining1(7072, df_15min, taus1)
+testList1[4]
+```
+```{r}
+taus2 <- seq(1,20)
+testList2 <- linearModelTraining1(7072, df_hourly, taus2)
+testList2[4]
+```
+```{r}
+taus3 <- seq(1,20)
+testList3 <- linearModelTraining1(7072, df_daily, taus3)
+testList3[4]
+```
+```{r}
+taus4 <- seq(1,20)
+testList4 <- linearModelTraining1(7072, df_weekly, taus4)
+testList4[4]
+```
+```{r}
+plotFunctionAcrossTime(testList1,testList2,testList3,testList4)
+```
+
+test(XXXX)
+```{r}
+taus1 <- seq(530,550)
+testList1 <- linearModelTraining1(7056, df_15min, taus1)
+testList1[4]
+```
+```{r}
+taus2 <- seq(1,20)
+testList2 <- linearModelTraining1(7034, df_hourly, taus2)
+testList2[4]
+```
+```{r}
+taus3 <- seq(1,20)
+testList3 <- linearModelTraining1(7034, df_daily, taus3)
+testList3[4]
+```
+```{r}
+taus4 <- seq(1,20)
+testList4 <- linearModelTraining1(7034, df_weekly, taus4)
+testList4[4]
+```
+```{r}
+plotFunctionAcrossTime(testList1,testList2,testList3,testList4)
+```
+
+
+```{r}
+plotFunctionAcrossTaus(taus1, testList1)
+```
+
+
+
+
+
+Autoregressive model
+```{r}
+retrieveTrainingDf2 <- function(id, Fulldf, tau) {
+  upstreamPosition <- NA
+  stationPosition <- which(riverStations == as.character(id))
+  
+  if (stationPosition == 1) {
+    df <- Fulldf %>% filter(station_id == id) %>%
+                     mutate(heightU = 0) %>% 
+                     select(date, heightU, height, station_id)
+  } else if (stationPosition != 1 & adjMatrix1[stationPosition-1, stationPosition] == 1) {
+    upstreamPosition <- stationPosition - 1
+    dfUpstream <- Fulldf %>% filter(station_id == riverStations[upstreamPosition])
+    df <- Fulldf %>% filter(station_id == id) %>%
+                     mutate(heightU = dfUpstream$height) %>% 
+                     select(date, heightU, height, station_id)
+  } else {
+    df <- Fulldf %>% filter(station_id == id) %>%
+                   mutate(heightU = 0) %>% 
+                   select(date, heightU, height, station_id)
+  }
+  
+  if (tau < nrow(df)) {
+    df <- df %>% mutate(heightU = c(rep(NA, tau), heightU[1:(nrow(df) - tau)]))
+  } else {
+    warning("tau too large!!")
+  }
+
+  df <- df %>% mutate(heightAR = lag(height, 1)) %>%
+               filter(!is.na(heightU)) %>%
+               filter(!is.na(heightAR)) %>%
+               select(date, height, heightAR, heightU, station_id)
+  
+  return(df)
+}
+```
+
+```{r}
+ARModelTraining <- function(id, df, tauVec) {
+  infoList <- list(taus = tauVec,models = list(), AIC = numeric(), Rsquare = numeric())
+  
+  for (i in seq_along(tauVec)) {
+    trainingDf <- retrieveTrainingDf2(id, df, tauVec[i])
+    model <- lm(height ~ 1 + heightAR + heightU, data = trainingDf)
+    infoList$models[[i]] <- model
+    infoList$AIC[i] <- AIC(model)
+    infoList$Rsquare[i] <- summary(model)$adj.r.squared
+  }
+  
+  return(infoList)
+}
+```
+
+test(XXXX)
+```{r}
+taus1 <- seq(1,20)
+testList1 <- ARModelTraining(7048, df_15min, taus1)
+testList1[4]
+```
+```{r}
+taus2 <- seq(1,20)
+testList2 <- ARModelTraining(7035, df_hourly, taus2)
+testList2[4]
+```
+```{r}
+taus3 <- seq(1,20)
+testList3 <- ARModelTraining(7035, df_daily, taus3)
+testList3[4]
+```
+```{r}
+taus4 <- seq(1,20)
+testList4 <- ARModelTraining(7035, df_weekly, taus4)
+testList4[4]
+```
+```{r}
+plotFunctionAcrossTime(testList1,testList2,testList3,testList4)
+```
+
+```{r}
+plotFunctionAcrossTaus(taus4, testList4)
+```
+
+
+
+
+
+
+
+model2: rainfall included
+
+loading data
+loading allStations data
+```{r}
+filename_base <- "River height/"
+filename <- paste0(filename_base, "All Stations Data", ".csv")
+df_all_stations <- read.csv(filename)
+
+df_all_stations <- df_all_stations %>% mutate(datetime=as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")) %>%         mutate(date=if_else(is.na(datetime), make_datetime(year(date), month(date), day(date), 0, 0, 0), datetime)) %>%
+                    arrange(station_id, date) %>% select(-datetime) 
+```
+
+load all Rainfall data
+```{r}
+filename_base <- "Rainfall/"
+filename <- paste0(filename_base, "All Rainfall Data", ".csv")
+df_rain_all <- read.csv(filename)
+
+df_rain_all <- df_rain_all %>% mutate(datetime=as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")) %>%         mutate(date=if_else(is.na(datetime), make_datetime(year(date), month(date), day(date), 0, 0, 0), datetime)) %>%
+                    arrange(station_id, date) %>% select(-datetime)
+```
+
+
+getting rainfall data at riverheight stations(given windowSize, )
+```{r}
+library("zoo")
+```
+
+```{r}
+windowSize <- 48
+combinedRainfall <- function(df, windowSize) {
+  df <- df  %>% group_by(station_id) %>%
+                arrange(date) %>%
+                mutate(Rainfall = rollapply(value, width = windowSize, FUN = sum, fill = NA, align = "right", partial = FALSE)) %>%
+                ungroup() %>% arrange(station_id, date) %>%
+                filter(!is.na(Rainfall))
+}
+
+df_rain_combined_all <- combinedRainfall(df_rain_all, windowSize)
+```
+
+retrieving rainfall station location data
+```{r}
+library(readxl)
+file_path <- "station positions/rainfall positions.xlsx"
+rainfallPositions <- read_excel(file_path)
+rainfallPositions <- as.data.frame(rainfallPositions)[,2:4] %>% rename(station_id = ID)
+print(rainfallPositions)
+```
+
+```{r}
+library(sp)
+library(gstat)
+library(geosphere)
+```
+
+```{r}
+getStationPosition <- function(id, df) {
+  long <- as.numeric((df %>% filter(ID == as.character(id)))[3])
+  lat <- as.numeric((df %>% filter(ID == as.character(id)))[2])
+  posDf <- data.frame(longitude = long , latitude = lat)
+  return(posDf)
+}
+
+nearestKStations <- function(df, id, k = 4 ) {
+  new_station <- getStationPosition(id, positionData)
+  df$distance <- distHaversine(matrix(c(df$longitude, df$latitude), ncol = 2), matrix(c(new_station$longitude, new_station$latitude), ncol = 2))
+  
+  NearestStations <- df %>% arrange(distance) %>% head(k) %>% select(-distance)
+  return(NearestStations)
+}
+```
+
+
+retrieve combined rainfall at river height staton  ## extremely time-consuming!!!!!
+```{r}
+riverHeightRainfall <- function(id, k=4, dfRain) {
+  neighbourStations <- nearestKStations(rainfallPositions, id, k)
+  df <- merge(dfRain, neighbourStations , by = "station_id") %>% 
+        arrange(station_id, date) %>% select(-value)
+  coordinates(df) <- ~longitude + latitude
+  
+  riverStation <- getStationPosition(id, positionData)
+  coordinates(riverStation) <- ~longitude+latitude
+  
+  idwResults <- list()
+  for (i in unique(df$date)) {
+    dfSubset <- subset(df, date == i)
+    idwResult <- idw(Rainfall ~ 1, dfSubset, riverStation)
+    idwResults[[as.character(i)]] <- idwResult@data$var1.pred
+  }
+
+  riverStationRainfall <- data.frame(
+    date = unique(dfRain$date),
+    rainfall = unlist(idwResults)
+  )
+  
+  return(riverStationRainfall)
+}
+```
+
+get Training data and train models
+```{r}
+mergeTrainingDf <- function(id, df, rainfallDf, tau) {
+  trainingDf1 <- retrieveTrainingDf(id, df, tau)
+  trainingDf <- merge(trainingDf1, rainfallDf , by = "date")
+  
+  return(trainingDf)
+}
+
+
+linearModelTraining2 <- function(id, df, rainfallDf, tauVec) {
+  infoList <- list(models = list(), AIC = numeric(), Rsquare = numeric())
+  
+  for (i in seq_along(tauVec)) {
+    trainingDf <- mergeTrainingDf(id, df, rainfallDf, tauVec[i])
+    model <- lm(height ~ 1 + heightU + rainfall, data = trainingDf)
+    infoList$models[[i]] <- model
+    infoList$AIC[i] <- AIC(model)
+    infoList$Rsquare[i] <- summary(model)$adj.r.squared
+  }
+  
+  return(infoList)
+}
+```
+
+modelling (for specific station)
+```{r}
+id <- ..
+rainfallDf <- riverHeightRainfall(id, 4, df_rain_combined_all)
+taus <- c(5,48,96,192, 384, 768)  #can be changed
+testList2 <- linearModelTraining2(id, df_all_stations, rainfallDf, taus)
+testList2
+```
+
+
+test(7072)
+#7072
+```{r}
+neighbourStations <- nearestKStations(rainfallPositions, 7072, 4)
+neighbourStations 
+```
+```{r}
+df <- merge(df_rain_combined_all, neighbourStations , by = "station_id") %>% 
+      arrange(station_id, date) %>% select(-value)
+df
+coordinates(df) <- ~longitude + latitude
+
+riverStation <- getStationPosition(7072, positionData)
+coordinates(riverStation) <- ~longitude+latitude
+```
+
+```{r}
+riverStationRainfall <- riverHeightRainfall(7072, 4, df_rain_combined_all)
+```
+
+```{r}
+dftest <- merge(trainingDf, riverStationRainfall , by = "date")
+```
+
+```{r}
+taus <- c(5,48,96,192, 384) 
+taus2 <- seq(1,20)
+testList2 <- linearModelTraining2(7072, df_all_stations, riverStationRainfall, taus2)
+testList2
+```
+
+plots
+```{r}
+plotData <- data.frame(taus2, testList2$AIC, testList2$Rsquare)
+library(ggplot2)
+ggplot(plotData, aes(x = taus2, y = testList2$AIC)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "AIC vs. tau", x = "tau", y = "AIC") +
+  theme_minimal()
+
+ggplot(plotData, aes(x = taus2, y = testList2$Rsquare)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "(adjusted)Rsquare vs. tau", x = "tau", y = "Rsquare") +
+  theme_minimal()
+```
+
+
+
+
+
